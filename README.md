@@ -55,6 +55,8 @@ Tests use synthetic data. Service, HTTP handler and MCP tests do not prove real 
 
 ## Web and MCP contracts
 
+See [MCP-CONTRACT.md](MCP-CONTRACT.md) for the complete tool inventory, read/write annotations, Activity side effects, retry semantics and unchanged OAuth boundary.
+
 The web API is `/api/workspace`. Reads use `view=projects|project|topics|topic|records|record|handoff|activities|activity|history` and a `project` identifier when applicable. Writes require Clerk owner authentication and matching `Origin`; supported actions are `create_project`, `submit_activity`, `reconcile_activity`, and `approve_candidate`.
 
 The MCP toolset retains `list_projects`, `create_project`, `read_context`, `read_record`, `search_memory`, and `commit_changes`, and adds `submit_activity`, `reconcile_activity`, `list_activities`, `read_activity`, and `list_history`. Execution results use Activity submission; `commit_changes` is for planning, Topic setup, and explicit maintenance. Keep operation/result IDs stable on retries. A pending Activity preserves the report without falsely confirming current memory.

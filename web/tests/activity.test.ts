@@ -11,6 +11,7 @@ import { submitActivity, reconcileActivity, approveCandidate } from '../lib/acti
 import { listActivities, listHistory, readActivity } from '../lib/activity-read';
 import { submitActivitySchema, type ActivityInput } from '../lib/activity-model';
 import { createProjectMcp } from '../lib/mcp-server';
+import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 const when = '2026-10-12T16:30:00.000Z'; // Oct 13 in Seoul, Oct 12 in UTC.
 const schema = await readFile(new URL('../db/001-initial.sql',import.meta.url),'utf8');
@@ -31,6 +32,35 @@ async function fixture(timezone='Asia/Seoul') {
   return {sql,db,actor,close:()=>sql.close()};
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
+function mcp(f: Fixture, db: Database = f.db) {
+  const handler = createProjectMcp(() => db);
+  async function rpc(method: string, params: unknown, userId: string | null = f.actor.id) {
+    const req = new Request('http://127.0.0.1/mcp', {
+      method: 'POST', headers: {'content-type':'application/json', accept:'application/json, text/event-stream'},
+      body: JSON.stringify({jsonrpc:'2.0', id:1, method, params}),
+    });
+    if (userId) req.auth = {token:'synthetic-token', clientId:'local-contract-test', scopes:[], extra:{userId}};
+    const response = await handler(req);
+    const raw = await response.text();
+    const json = raw.startsWith('event:') || raw.startsWith('data:')
+      ? raw.split('\n').filter(s => s.startsWith('data:')).map(s => JSON.parse(s.slice(5))).find(s => s.id === 1)
+      : JSON.parse(raw);
+    assert.equal(response.status, 200, raw);
+    assert.equal(json.error, undefined, JSON.stringify(json.error));
+    return json.result;
+  }
+  return {rpc, call: (name: string, args: object, userId: string | null = f.actor.id) =>
+    rpc('tools/call', {name, arguments:args}, userId)};
+}
+async function snapshot(f: Fixture) {
+  const names = (await f.db.query<{tablename:string}>("SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename")).rows;
+  const result: Record<string, string[]> = {};
+  for (const {tablename} of names) {
+    assert.match(tablename, /^[a-z_]+$/);
+    result[tablename] = (await f.db.query(`SELECT * FROM ${tablename}`)).rows.map(row => JSON.stringify(row)).sort();
+  }
+  return result;
+}
 function submission(overrides:Record<string,unknown> = {}):ActivityInput {
   const source=randomUUID();
   return submitActivitySchema.parse({
@@ -412,4 +442,193 @@ test('completion cannot omit Work Topic context; its pending result remains visi
     assert.equal((await readTopic(f.db,f.actor,'cache')).pending_activities.items[0].id,r.activity_id);
     assert.equal((await readRecord(f.db,f.actor,'work')).record.state,'ready');
   }finally {await f.close();}
+});
+
+test('MCP catalog describes actual boundaries; every read variant leaves the whole database unchanged', {timeout:30000}, async t => {
+  const f = await fixture(), oldOwner = process.env.DEVELOPLOG_OWNER_ID;
+  process.env.DEVELOPLOG_OWNER_ID = f.actor.id;
+  try {
+    await createWork(f);
+    const s = await confirmed(f);
+    s.history = {significance:'behavior', summary:'Expiry observed', reason:'Synthetic meaningful change', topic_ids:['cache'], evidence_ids:['test']};
+    const activity = await submitActivity(f.db, f.actor, s);
+    const revision = (await f.db.query<{id:string}>('SELECT id FROM knowledge_revisions LIMIT 1')).rows[0].id;
+    const before = await snapshot(f);
+    let queries = 0;
+    const guarded = (executor: Database | Parameters<Parameters<Database['transaction']>[0]>[0]) => ({
+      query: <T>(sql: string, params?: unknown[]) => {
+        assert.match(sql.trim(), /^(SELECT\b|SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY$)/i);
+        assert.doesNotMatch(sql, /\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|CALL|NEXTVAL|SETVAL)\b/i);
+        queries++;
+        return executor.query<T>(sql, params);
+      },
+    });
+    const readDb: Database = {...guarded(f.db), transaction: fn => f.db.transaction(tx => fn(guarded(tx)))};
+    const {rpc, call} = mcp(f, readDb);
+    t.mock.method(globalThis, 'fetch', () => {throw new Error('MCP memory reads must not fetch external resources');});
+    const catalog: Tool[] = (await rpc('tools/list', {})).tools;
+    const readNames = ['list_projects','read_context','read_record','search_memory','list_activities','read_activity','list_history'];
+    assert.deepEqual(catalog.map(tool => tool.name).sort(), [...readNames,'create_project','commit_changes','submit_activity','reconcile_activity'].sort());
+    for (const tool of catalog) {
+      assert.equal(tool.annotations?.openWorldHint, false, tool.name);
+      assert.equal(tool.annotations?.readOnlyHint, readNames.includes(tool.name), tool.name);
+      assert.equal(tool.annotations?.destructiveHint, !readNames.includes(tool.name) && tool.name !== 'create_project', tool.name);
+      if (!readNames.includes(tool.name)) assert.equal(tool.annotations?.idempotentHint, true, tool.name);
+    }
+    for (const name of ['submit_activity','reconcile_activity']) {
+      const schema = catalog.find(tool => tool.name === name)!.inputSchema;
+      assert.ok(schema.properties?.memory);
+      assert.ok(schema.required?.includes('project_id'));
+      // Checking the actual serialized union catches runtime-only Zod refinements.
+      assert.doesNotMatch(JSON.stringify(schema), /"(?:const|enum)":(?:"save_record"|\["save_record"\])/);
+    }
+    assert.match(JSON.stringify(catalog.find(tool => tool.name === 'commit_changes')!.inputSchema), /"const":"save_record"/);
+    const pid = {project_id:f.actor.projectId};
+    const reads: [string, object][] = [
+      ['list_projects',{limit:1}],
+      ...['project','topic','work','topics','records'].map(target => ['read_context', {...pid,target,id:target === 'work' ? 'work' : 'cache'}] as [string,object]),
+      ['read_record',{...pid,type:'record',id:'work'}],
+      ['read_record',{...pid,type:'topic_detail',id:'cache'}],
+      ['read_record',{...pid,type:'revisions',id:'cache',entity_type:'topic',limit:1}],
+      ['read_record',{...pid,type:'revision',id:revision}],
+      ['read_record',{...pid,type:'source',id:s.sources[0].id,source_limit:5}],
+      ['search_memory',{...pid,query:'Expiry',limit:1}],
+      ['list_activities',{...pid,limit:1}], ['list_activities',{...pid,status:'pending'}],
+      ['read_activity',{...pid,id:activity.activity_id}], ['list_history',{...pid,date:'2026-10-13'}],
+    ];
+    for (const [name,args] of reads) {
+      const result = await call(name,args);
+      assert.equal(result.isError, undefined, `${name}: ${JSON.stringify(result)}`);
+    }
+    assert.ok(queries > reads.length);
+    assert.deepEqual(await snapshot(f), before);
+  } finally {
+    if (oldOwner === undefined) delete process.env.DEVELOPLOG_OWNER_ID; else process.env.DEVELOPLOG_OWNER_ID = oldOwner;
+    await f.close();
+  }
+});
+
+test('MCP submit round-trip updates Activity, Topic, Work and History once; failed requests retry safely', {timeout:30000}, async () => {
+  const f = await fixture(), oldOwner = process.env.DEVELOPLOG_OWNER_ID;
+  process.env.DEVELOPLOG_OWNER_ID = f.actor.id;
+  try {
+    await createWork(f);
+    const {call} = mcp(f), pid = {project_id:f.actor.projectId};
+    const s = await confirmed(f);
+    s.work_id = 'work';
+    s.memory.work_result = {expected_version:1,conclusion:'verified_complete',checks:[{criterion_id:'expiry',satisfied:true,evidence_ids:['test'],note:'Observed in synthetic local test'}]};
+    s.history = {significance:'behavior',summary:'Verified expiry',reason:'Behavior established',topic_ids:['cache'],evidence_ids:['test']};
+    const args = {...pid,...s};
+    const first = await call('submit_activity',args);
+    assert.equal(first.isError,undefined,JSON.stringify(first));
+    const data = JSON.parse(first.content[0].text);
+    assert.equal(data.memory_status,'applied'); assert.ok(data.history_id);
+    const applied = await snapshot(f);
+    const exactRetry = await call('submit_activity',args);
+    assert.equal(exactRetry.isError,undefined);
+    assert.deepEqual(JSON.parse(exactRetry.content[0].text),data);
+    assert.deepEqual(await snapshot(f),applied);
+    const changed = await call('submit_activity',{...args,result:'Changed content with the same operation'});
+    assert.equal(JSON.parse(changed.content[0].text).status,409);
+    assert.deepEqual(await snapshot(f),applied);
+    const duplicate = JSON.parse((await call('submit_activity',{...args,operation_id:randomUUID()})).content[0].text);
+    assert.equal(duplicate.duplicate,true); assert.equal(duplicate.activity_id,data.activity_id);
+    const activity = JSON.parse((await call('read_activity',{...pid,id:data.activity_id})).content[0].text);
+    const topic = JSON.parse((await call('read_context',{...pid,target:'topic',id:'cache'})).content[0].text);
+    const work = JSON.parse((await call('read_record',{...pid,type:'record',id:'work'})).content[0].text);
+    const history = JSON.parse((await call('list_history',pid)).content[0].text);
+    assert.equal(activity.activity.memory_status,'applied'); assert.equal(topic.topic.version,2);
+    assert.equal(work.record.state,'done'); assert.equal(work.record.recommendation.model,'Sol');
+    assert.equal(history.items.length,1); assert.equal(history.items[0].activity_id,data.activity_id);
+    assert.equal(await count(f,'activities'),1); assert.equal(await count(f,'history'),1);
+    const failed = submission();
+    failed.verification[0].source_id = randomUUID();
+    const beforeFailure = await snapshot(f);
+    const error = await call('submit_activity',{...pid,...failed});
+    assert.equal(JSON.parse(error.content[0].text).status,400);
+    assert.deepEqual(await snapshot(f),beforeFailure);
+    // A rolled-back operation has no cached result; retry the corrected request.
+    failed.verification[0].source_id = failed.sources[0].id;
+    assert.equal((await call('submit_activity',{...pid,...failed})).isError,undefined);
+    const stale = await confirmed(f);
+    stale.memory.read_set[0].context_version = 1;
+    const pending = JSON.parse((await call('submit_activity',{...pid,...stale})).content[0].text);
+    assert.equal(pending.memory_status,'pending');
+    const current = (await readTopic(f.db,f.actor,'cache')).topic;
+    stale.memory.read_set[0].context_version = current.context_version;
+    const reconcileArgs = {...pid,operation_id:randomUUID(),activity_id:pending.activity_id,expected_memory_version:1,memory:stale.memory};
+    const reconciled = await call('reconcile_activity',reconcileArgs);
+    assert.equal(JSON.parse(reconciled.content[0].text).status,'applied');
+    const afterReconcile = await snapshot(f);
+    const reconciledRetry = await call('reconcile_activity',reconcileArgs);
+    assert.equal(reconciledRetry.isError,undefined);
+    assert.deepEqual(JSON.parse(reconciledRetry.content[0].text),JSON.parse(reconciled.content[0].text));
+    assert.deepEqual(await snapshot(f),afterReconcile);
+  } finally {
+    if (oldOwner === undefined) delete process.env.DEVELOPLOG_OWNER_ID; else process.env.DEVELOPLOG_OWNER_ID = oldOwner;
+    await f.close();
+  }
+});
+
+test('all MCP tools enforce owner authentication; write references cannot cross project boundaries', {timeout:30000}, async () => {
+  const f = await fixture(), oldOwner = process.env.DEVELOPLOG_OWNER_ID;
+  process.env.DEVELOPLOG_OWNER_ID = f.actor.id;
+  try {
+    const {call} = mcp(f), pid = {project_id:f.actor.projectId};
+    const s = submission();
+    const writes: [string,object][] = [
+      ['create_project',{project_id:randomUUID(),name:'Synthetic auth test'}],
+      ['commit_changes',{...pid,operation_id:randomUUID(),read_set:[],reason:'Synthetic test',changes:[{type:'save_topic',topic_id:'new',expected_version:0,title:'New',slug:'new',intro:''}]}],
+      ['submit_activity',{...pid,...s}],
+      ['reconcile_activity',{...pid,operation_id:randomUUID(),activity_id:randomUUID(),expected_memory_version:1,memory:s.memory}],
+    ];
+    const reads: [string,object][] = [
+      ['list_projects',{}],['read_context',{...pid,target:'project'}],['read_record',{...pid,type:'record',id:'work'}],
+      ['search_memory',{...pid,query:'cache'}],['list_activities',pid],['read_activity',{...pid,id:randomUUID()}],['list_history',pid],
+    ];
+    const before = await snapshot(f);
+    for (const [name,args] of [...reads,...writes]) {
+      for (const [userId,status] of [[null,401],['synthetic-stranger',403]] as const) {
+        const result = await call(name,args,userId);
+        assert.equal(result.isError,true,name); assert.equal(JSON.parse(result.content[0].text).status,status,name);
+      }
+    }
+    delete process.env.DEVELOPLOG_OWNER_ID;
+    assert.equal(JSON.parse((await call('list_projects',{})).content[0].text).status,403);
+    process.env.DEVELOPLOG_OWNER_ID = f.actor.id;
+    assert.deepEqual(await snapshot(f),before);
+    const foreign = {...f.actor,projectId:randomUUID()};
+    await createProject(f.db,foreign,{project_id:foreign.projectId,name:'Second synthetic project'});
+    await commitChanges(f.db,foreign,{operation_id:randomUUID(),read_set:[],reason:'Foreign fixture',changes:[
+      {type:'save_topic',topic_id:'foreign-topic',expected_version:0,title:'Foreign',slug:'foreign',intro:''},
+      {type:'save_record',id:'foreign-work',expected_version:0,record:{kind:'work',title:'Foreign work',state:'ready'}},
+    ]});
+    const foreignInput = submission({topic_ids:['foreign-topic']});
+    const foreignActivity = await submitActivity(f.db,foreign,foreignInput);
+    const scopedBefore = await snapshot(f);
+    const broadWrite = await call('submit_activity',{...pid,...s,memory:{...s.memory,changes:[
+      {type:'save_record',id:'forbidden',expected_version:0,record:{kind:'work',title:'Forbidden broad write',state:'ready'}},
+    ]}});
+    assert.equal(broadWrite.isError,true);
+    const attempts = [
+      {...s,topic_ids:['foreign-topic']}, {...s,work_id:'foreign-work'},
+      {...s,correction:{activity_id:foreignActivity.activity_id,reason:'Wrong project'}},
+      {...s,sources:[],verification:[{...s.verification[0],source_id:foreignInput.sources[0].id}]},
+      {...s,history:{significance:'behavior',summary:'Wrong project',reason:'Scope check',topic_ids:['foreign-topic'],evidence_ids:['test']}},
+    ];
+    for (const attempt of attempts) {
+      const result = await call('submit_activity',{...pid,...attempt,operation_id:randomUUID()});
+      assert.equal(result.isError,true,JSON.stringify(result));
+    }
+    const crossReconcile = await call('reconcile_activity',{...pid,operation_id:randomUUID(),activity_id:foreignActivity.activity_id,expected_memory_version:1,memory:s.memory});
+    assert.equal(JSON.parse(crossReconcile.content[0].text).status,404);
+    const crossCommit = await call('commit_changes',{...pid,operation_id:randomUUID(),read_set:[],reason:'Wrong project',changes:[
+      {type:'save_record',id:'attempt',expected_version:0,record:{kind:'work',title:'Invalid dependency',state:'ready',depends_on:['foreign-work']}},
+    ]});
+    assert.equal(JSON.parse(crossCommit.content[0].text).status,400);
+    assert.deepEqual(await snapshot(f),scopedBefore);
+  } finally {
+    if (oldOwner === undefined) delete process.env.DEVELOPLOG_OWNER_ID; else process.env.DEVELOPLOG_OWNER_ID = oldOwner;
+    await f.close();
+  }
 });

@@ -267,7 +267,7 @@ const topicChange = {
   expected_version: z.number().int().nonnegative(),
 };
 const ruleChange = { ...topicChange, rule_id: idSchema };
-export const changeSchema = z.discriminatedUnion("type", [
+export const topicChangeSchema = z.discriminatedUnion("type", [
   z.object({
     type:z.literal('retract_actual'), ...ruleChange,
     reason:shortText, source_ids:z.array(idSchema).min(1).max(8),
@@ -321,6 +321,9 @@ export const changeSchema = z.discriminatedUnion("type", [
   z
     .object({ type: z.literal("set_gap"), ...ruleChange, gap: gapSchema })
     .strict(),
+]);
+export const changeSchema = z.discriminatedUnion("type", [
+  ...topicChangeSchema.options,
   z
     .object({
       type: z.literal("save_record"),

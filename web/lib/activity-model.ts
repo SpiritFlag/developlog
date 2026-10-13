@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { changeSchema, criterionSchema, evidenceSchema, idSchema, readSetSchema, sourceInputSchema } from "./model";
+import { topicChangeSchema, criterionSchema, evidenceSchema, idSchema, readSetSchema, sourceInputSchema } from "./model";
 import { recommendationSchema } from "./work-recommendation";
 
 const text = z.string().trim().min(1).max(1200);
@@ -17,10 +17,9 @@ export const workResultSchema = z.object({
 }).strict();
 export const memoryProposalSchema = z.object({
   read_set: readSetSchema,
-  changes: z.array(changeSchema).max(30).refine(
-    changes => changes.every(c => c.type !== 'save_record'),
-    'Activity memory proposals only change Topics; use work_result and follow_ups for Work.',
-  ),
+  // Encode the boundary in JSON Schema too, not only an invisible runtime refinement.
+  changes: z.array(topicChangeSchema).max(30)
+    .describe('Commands for existing Topics in topic_ids only. No save_record; Work uses work_result or follow_ups. Empty when memory is unchanged.'),
   work_result: workResultSchema.nullable().default(null),
   reason: text,
 }).strict();
