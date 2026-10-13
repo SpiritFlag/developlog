@@ -1,0 +1,13 @@
+.git/**
+.local/**
+.env*
+.vercel/**
+node_modules/**
+.next/**
+tests/**
+test-results/**
+playwright-report/**
+*.tsbuildinfo
+*.log
+AGENTS.md
+CLAUDE.md
