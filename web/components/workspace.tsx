@@ -34,6 +34,7 @@ import {
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { HandoffRecommendation } from "./handoff-recommendation";
+import { ConnectionSetup } from "./connection-setup";
 import type { Recommendation } from "@/lib/work-recommendation";
 import type { Activity } from "@/lib/activity-model";
 import {
@@ -322,7 +323,7 @@ export default function Workspace({ projectId }: { projectId: string }) {
         )}
         <div className="sidebar-bottom">
           <button onClick={() => setConnectOpen(true)}>
-            <MessageSquareText size={17} /> ChatGPT와 이어가기{" "}
+            <MessageSquareText size={17} /> 연결 설정{" "}
             <ArrowRight size={14} />
           </button>
           <div className="user-row">
@@ -444,32 +445,10 @@ export default function Workspace({ projectId }: { projectId: string }) {
       )}
       {connectOpen && (
         <Dialog
-          title="ChatGPT와 프로젝트 이어가기"
+          title="프로젝트 연결 설정"
           close={() => setConnectOpen(false)}
         >
-          <p className="dialog-lead">
-            여기서 현재를 읽고, 생각과 작업은 ChatGPT에서 함께 정리해요.
-          </p>
-          <ol className="steps">
-            <li>ChatGPT에서 프로젝트와 관련 주제를 읽어요.</li>
-            <li>작업의 전달문을 다듬고 회사 Codex에 복사해요.</li>
-            <li>Codex의 완료보고를 ChatGPT로 가져와요.</li>
-            <li>바뀐 동작과 확인한 범위만 Developlog에 반영해요.</li>
-          </ol>
-          <p>
-            회사 Codex에 개인 MCP를 연결하지 않아도 괜찮아요. 복사해서 주고받는
-            흐름이 기본이에요.
-          </p>
-          <details>
-            <summary>MCP 연결 주소</summary>
-            <code className="code-block">
-              https://developlog.spiritflag.work/mcp
-            </code>
-            <p>
-              OAuth로 소유자 계정에 연결해요. 도구가 예전 목록으로 보이면 연결의
-              도구 목록을 새로고침해 주세요.
-            </p>
-          </details>
+          {current.data ? <ConnectionSetup key={current.data.project.id + current.data.project.mode + current.data.project.github_repository} project={current.data.project} /> : current.error ? <Failure>{current.error}</Failure> : <Loading />}
         </Dialog>
       )}
       {projectOpen && (

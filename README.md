@@ -53,6 +53,12 @@ npm run test:postgres
 
 Tests use synthetic data. Service, HTTP handler and MCP tests do not prove real Clerk login or OAuth authorization-code/refresh flows. Those require a separately configured authentication environment.
 
+## Project connection onboarding
+
+The project's **연결 설정** dialog copies a version 1.0.1 Codex installation request or an AGENTS.md managed block. Connected projects reuse the existing personal MCP connection; Handoff projects use supplied instructions and do not connect a personal MCP in a company environment. Web copying and the local installer share one renderer.
+
+See [the public onboarding guide](web/ONBOARDING.md) for installation from this repository, the repository-scoped [Codex skill](.agents/skills/developlog-connect/SKILL.md), and the local recovery helper. The public helper requires an explicit target root and project ID and has no network or authentication capability. Copied instructions are self-contained; no private release documents or local credentials are needed.
+
 ## Web and MCP contracts
 
 See [MCP-CONTRACT.md](MCP-CONTRACT.md) for the complete tool inventory, read/write annotations, Activity side effects, retry semantics and unchanged OAuth boundary.
